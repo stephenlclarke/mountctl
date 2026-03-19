@@ -128,6 +128,7 @@ readonly DNSSERVER="${DNSSERVER_ENV:-10.20.40.200}"
 readonly OFFICE_IP_PREFIX="${OFFICE_IP_PREFIX_ENV:-10.20.}"
 readonly STATEDIR="${TMPDIR:-/tmp}/mountctl-dns"
 readonly INSTALL_PATH="/usr/local/bin/mountctl"
+readonly REQUIRED_BASH_BIN="/opt/homebrew/bin/bash"
 readonly LAUNCH_AGENT_LABEL="tools.xyzzy.mountctl"
 readonly LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist"
 readonly BREW_BIN="/opt/homebrew/bin/brew"
@@ -349,6 +350,10 @@ checkdependencies() {
 
   if [[ ! -x "$BREW_BIN" ]] && ! command -v brew >/dev/null 2>&1; then
     missing+=("Homebrew is required. Install it from https://brew.sh/")
+  fi
+
+  if [[ ! -x "$REQUIRED_BASH_BIN" ]]; then
+    missing+=("Homebrew Bash is required at $REQUIRED_BASH_BIN. Install it with: brew install bash")
   fi
 
   if [[ ! -x "$SSHFS_BIN" ]]; then

@@ -27,6 +27,7 @@ When it changes DNS, it first stores the original resolver state in `/tmp/mountc
 - Homebrew Bash at `/opt/homebrew/bin/bash`
 - macFUSE
 - SSHFS from the macFUSE project at `/usr/local/bin/sshfs`
+- `sudo` access for installing `/usr/local/bin/mountctl` and changing macOS DNS settings
 
 Current install sources:
 
@@ -38,6 +39,8 @@ Current install sources:
 `mountctl install` checks those dependencies before it writes anything to `/usr/local/bin` or `~/Library/LaunchAgents`.
 
 If `mountctl install` detects the deprecated Homebrew `sshfs` at `/opt/homebrew/bin/sshfs`, it will warn but continue. That path is treated as a temporary fallback only; the preferred setup is still the macFUSE SSHFS package at `/usr/local/bin/sshfs`.
+
+The LaunchAgent and the `start`/`dns-up` paths call `sudo networksetup ...` when they need to modify DNS. For unattended background operation, your user needs to be able to run the required `sudo` commands non-interactively. If your Mac prompts for a password instead, manual commands may still work in an interactive shell, but the background LaunchAgent will not be able to repair DNS state on its own.
 
 ## Configuration
 
@@ -74,6 +77,8 @@ That command:
 - writes `~/Library/LaunchAgents/tools.xyzzy.mountctl.plist`
 - reloads the LaunchAgent into the current GUI session
 - persists any install-time environment overrides into the LaunchAgent
+
+It also assumes the invoking user can run the required `sudo` operations for `/usr/local/bin` installation and DNS updates without getting stuck on an unattended password prompt.
 
 The LaunchAgent is configured with:
 
