@@ -1,0 +1,812 @@
+#!/opt/homebrew/bin/bash
+
+# mountctl - manage office DNS ordering and SSHFS mounts for London hosts.
+# Copyright (C) 2026 Steve Clarke <stephenlclarke@mac.com> - https://xyzzy.tools
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# In accordance with section 13 of the AGPL, if you modify this program,
+# your modified version must prominently offer all users interacting with it
+# remotely through a computer network an opportunity to receive the source
+# code of your version.
+#------------------------------------------------------------------------
+# USAGE:
+#   __SCRIPT_NAME__ - manage London office DNS and SSHFS mounts
+#
+#   ./__SCRIPT_NAME__ <command>
+#
+# COMMANDS:
+#   install    Install or refresh mountctl and its LaunchAgent
+#   bootstrap  Alias for install
+#   start      Apply office DNS and mount reachable hosts
+#   stop       Restore prior DNS state and unmount managed mounts
+#   status     Show current DNS settings and managed mount status
+#   run        Auto mode for the LaunchAgent: start in the office, stop elsewhere
+#   up         Alias for start
+#   down       Alias for stop
+#   dns-up     Apply office DNS only
+#   dns-down   Restore prior DNS only
+#   mount      Mount reachable hosts only
+#   unmount    Unmount managed hosts only
+#   -h, --help Show this help text
+#
+# EXAMPLES:
+#   ./__SCRIPT_NAME__ install
+#   ./__SCRIPT_NAME__ start
+#   REMOTE_PATH=/var/tmp ./__SCRIPT_NAME__ mount
+#   DNSSERVER=172.16.40.200 ./__SCRIPT_NAME__ dns-up
+#   OFFICE_IP_PREFIX=10.20. DNSSERVER=10.20.40.119 ./__SCRIPT_NAME__ start
+#   HOSTS="dev08 steve" ./__SCRIPT_NAME__ mount
+#------------------------------------------------------------------------
+
+set -euo pipefail
+
+readonly SELF_PATH="${BASH_SOURCE[0]:-$0}"
+readonly SCRIPT_NAME="$(basename "$SELF_PATH")"
+
+if [[ -n "${BASH_VERSINFO:-}" ]] && (( BASH_VERSINFO[0] < 4 )); then
+  printf 'ERROR: this script requires bash 4+ (detected: %s).\n' \
+    "${BASH_VERSION:-unknown}" >&2
+  exit 1
+fi
+
+readonly SCRIPT_COLOUR_MODE="${SCRIPT_COLOUR:-}"
+
+if [[ -t 2 && ! "${SCRIPT_COLOUR_MODE,,}" =~ ^(off|false|0)$ ]]; then
+  readonly COLOUR_ERROR=$'\033[31m'
+  readonly COLOUR_WARN=$'\033[38;5;214m'
+  readonly COLOUR_RESET=$'\033[0m'
+else
+  readonly COLOUR_ERROR=""
+  readonly COLOUR_WARN=""
+  readonly COLOUR_RESET=""
+fi
+
+if [[ -t 1 && ! "${SCRIPT_COLOUR_MODE,,}" =~ ^(off|false|0)$ ]]; then
+  readonly COLOUR_USAGE_HEADER=$'\033[33m'
+  readonly COLOUR_USAGE_RESET=$'\033[0m'
+else
+  readonly COLOUR_USAGE_HEADER=""
+  readonly COLOUR_USAGE_RESET=""
+fi
+
+readonly DEFAULT_HOSTS=(
+  dev01
+  dev02
+  dev03
+  dev04
+  dev05
+  dev06
+  dev07
+  dev08
+  steve
+  robin
+  barry
+  harry
+)
+if [[ -n "${HOSTS:-}" ]]; then
+  # HOSTS is intentionally split on shell words so callers can pass a simple
+  # space-delimited host list like: HOSTS="dev08 steve".
+  # shellcheck disable=SC2206
+  readonly HOSTS=(${HOSTS})
+else
+  readonly HOSTS=("${DEFAULT_HOSTS[@]}")
+fi
+readonly REMOTE_PATH="${REMOTE_PATH:-}"
+readonly MOUNT_ROOT="${HOME}/mnt"
+readonly SSHFS_BIN="${SSHFS_BIN:-/usr/local/bin/sshfs}"
+readonly HOMEBREW_SSHFS_BIN="/opt/homebrew/bin/sshfs"
+readonly DNSSERVER="${DNSSERVER:-172.16.40.119}"
+readonly OFFICE_IP_PREFIX="${OFFICE_IP_PREFIX:-172.16.}"
+readonly STATEDIR="${TMPDIR:-/tmp}/mountctl-dns"
+readonly INSTALL_PATH="/usr/local/bin/mountctl"
+readonly LAUNCH_AGENT_LABEL="com.company.mountctl"
+readonly LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist"
+readonly BREW_BIN="/opt/homebrew/bin/brew"
+readonly LOG_OUT="/tmp/mountctl.out"
+readonly LOG_ERR="/tmp/mountctl.err"
+
+
+# Print the embedded top-of-file usage block.
+usage() {
+
+  # Extract and render the opening help comment block from this script file.
+  awk -v script_name="$SCRIPT_NAME" \
+      -v header="$COLOUR_USAGE_HEADER" \
+      -v reset="$COLOUR_USAGE_RESET" '
+    NR == 1 { next }
+    NR == 2 {
+      if ($0 == "") {
+        inblock = 1
+        next
+      }
+      exit
+    }
+    inblock {
+      if ($0 == "") exit
+      if ($0 !~ /^#/) exit
+      if ($0 ~ /#--------/) {
+        print ""
+        next
+      }
+      line = $0
+      sub(/^#[ ]?/, "", line)
+      gsub(/__SCRIPT_NAME__/, script_name, line)
+      if (line ~ /^[A-Z0-9][A-Z0-9 ()+\/._-]*:$/) {
+        printf "%s%s%s\n", header, line, reset
+      } else {
+        print line
+      }
+    }
+  ' "$SELF_PATH"
+}
+
+
+# Print a fatal error message to stderr.
+error() {
+  printf '%sERROR%s: %s\n' "$COLOUR_ERROR" "$COLOUR_RESET" "$*" >&2
+}
+
+
+# Print a non-fatal warning to stderr.
+warning() {
+  printf '%sWARN%s: %s\n' "$COLOUR_WARN" "$COLOUR_RESET" "$*" >&2
+}
+
+
+# Print a human-facing informational message to stdout.
+info() {
+  printf '%s\n' "$*"
+}
+
+
+# Return a timestamp for log-file entries.
+ts() {
+  date "+%Y-%m-%d %H:%M:%S"
+}
+
+
+# Append a message to the standard output log file.
+log() {
+  printf '[%s] %s\n' "$(ts)" "$*" >>"$LOG_OUT"
+}
+
+
+# Append a message to the standard error log file.
+log_error() {
+  printf '[%s] %s\n' "$(ts)" "$*" >>"$LOG_ERR"
+}
+
+
+# Ensure a required command is present before runtime work begins.
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    error "missing required command: $1"
+    exit 1
+  }
+}
+
+
+# Report whether the LaunchAgent is currently loaded in the GUI session.
+launchagentloaded() {
+  launchctl print "gui/$(id -u)/${LAUNCH_AGENT_LABEL}" >/dev/null 2>&1
+}
+
+
+# Install the repo copy of the script into its canonical system path.
+installself() {
+
+  if [[ "$SELF_PATH" == "$INSTALL_PATH" && -x "$INSTALL_PATH" ]]; then
+    return 0
+  fi
+
+  log "installing script to $INSTALL_PATH from $SELF_PATH"
+  sudo install -m 755 "$SELF_PATH" "$INSTALL_PATH" >>"$LOG_OUT" 2>>"$LOG_ERR"
+}
+
+
+# Write the LaunchAgent plist that keeps mountctl running automatically.
+installlaunchagent() {
+
+  mkdir -p "$(dirname "$LAUNCH_AGENT_PLIST")"
+
+  cat >"$LAUNCH_AGENT_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${LAUNCH_AGENT_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>${INSTALL_PATH}</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>120</integer>
+
+    <key>KeepAlive</key>
+    <dict>
+      <key>NetworkState</key>
+      <true/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>${LOG_OUT}</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_ERR}</string>
+  </dict>
+</plist>
+EOF
+}
+
+
+# Validate external dependencies and print actionable setup guidance.
+checkdependencies() {
+  local missing=()
+
+  if [[ ! -x "$BREW_BIN" ]] && ! command -v brew >/dev/null 2>&1; then
+    missing+=("Homebrew is required. Install it from https://brew.sh/")
+  fi
+
+  if [[ ! -x "$SSHFS_BIN" ]]; then
+    if [[ -x "$HOMEBREW_SSHFS_BIN" ]]; then
+      warning "detected deprecated Homebrew sshfs at $HOMEBREW_SSHFS_BIN; continuing install. Prefer the macFUSE SSHFS package at /usr/local/bin/sshfs, or run with SSHFS_BIN=$HOMEBREW_SSHFS_BIN."
+      log "detected deprecated Homebrew sshfs at $HOMEBREW_SSHFS_BIN during install checks"
+    else
+      missing+=("Missing sshfs at $SSHFS_BIN. Install the current SSHFS package from macFUSE: https://macfuse.github.io/2025/11/11/SSHFS-3.7.5.html")
+    fi
+  elif [[ "$SSHFS_BIN" == "$HOMEBREW_SSHFS_BIN" ]]; then
+    warning "using deprecated Homebrew sshfs at $HOMEBREW_SSHFS_BIN; install will continue, but the preferred replacement is the macFUSE SSHFS package at /usr/local/bin/sshfs."
+    log "using deprecated Homebrew sshfs at $HOMEBREW_SSHFS_BIN during install checks"
+  elif [[ -x "$HOMEBREW_SSHFS_BIN" ]]; then
+    warning "deprecated Homebrew sshfs also exists at $HOMEBREW_SSHFS_BIN; install will continue using the preferred SSHFS path $SSHFS_BIN."
+    log "deprecated Homebrew sshfs present at $HOMEBREW_SSHFS_BIN during install checks"
+  fi
+
+  if ! pkgutil --pkg-info io.macfuse.installer.components.core >/dev/null 2>&1; then
+    missing+=("macFUSE is not installed. Install it from https://macfuse.io/")
+  fi
+
+  if ((${#missing[@]} == 0)); then
+    return 0
+  fi
+
+  log_error "missing dependencies"
+  error "mountctl is not installed yet and cannot finish setup because required dependencies are missing"
+
+  for item in "${missing[@]}"; do
+    log_error "  - $item"
+    printf '  - %s\n' "$item" >&2
+  done
+
+  printf '\nInstall the missing dependencies, then run:\n' >&2
+  printf '  %s install\n' "$SCRIPT_NAME" >&2
+
+  return 1
+}
+
+
+# Install or refresh the script and its LaunchAgent before runtime actions.
+ensurebootstrap() {
+  local needs_install=0
+
+  if [[ ! -x "$INSTALL_PATH" ]] || [[ "$SELF_PATH" != "$INSTALL_PATH" ]]; then
+    needs_install=1
+  fi
+
+  if [[ ! -f "$LAUNCH_AGENT_PLIST" ]]; then
+    needs_install=1
+  fi
+
+  if (( needs_install )); then
+    checkdependencies
+    installself
+    log "installing LaunchAgent at $LAUNCH_AGENT_PLIST"
+    installlaunchagent
+  fi
+
+  if ! launchagentloaded; then
+    ((needs_install += 1))
+    checkdependencies
+    log "loading LaunchAgent ${LAUNCH_AGENT_LABEL}"
+    launchctl bootout "gui/$(id -u)" "$LAUNCH_AGENT_PLIST" >/dev/null 2>&1 || true
+    launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST" >>"$LOG_OUT" 2>>"$LOG_ERR"
+  fi
+
+  if (( needs_install > 0 )); then
+    log "bootstrap complete for ${LAUNCH_AGENT_LABEL}"
+  fi
+}
+
+
+# Return the short local label used for a given host name.
+localname() {
+  local host="$1"
+
+  printf '%s\n' "$host"
+}
+
+
+# Map a macOS network-service name to a stable state-file path.
+svcfile() {
+  local service="$1"
+  local sum
+
+  # Network service names can contain spaces, so hash them into a stable file
+  # name that can be used safely under /tmp.
+  sum=$(printf '%s' "$service" | cksum | awk '{print $1}')
+
+  printf '%s/%s.dns\n' "$STATEDIR" "$sum"
+}
+
+
+# Return the manually configured DNS servers for a macOS network service.
+manualdns() {
+  local service="$1"
+  local out
+
+  out=$(networksetup -getdnsservers "$service" 2>/dev/null || true)
+
+  case "$out" in
+    "There aren't any DNS Servers set on "*)
+      return 1
+      ;;
+    "Could not find network service "*)
+      return 1
+      ;;
+  esac
+
+  printf '%s\n' "$out" | awk 'NF'
+}
+
+
+# Return the currently effective DNS server order from macOS resolver state.
+effectivedns() {
+
+  # Extract the resolver IP list from scutil's DNS view.
+  scutil --dns \
+    | awk '/nameserver\[[0-9]+\]/{print $3}' \
+    | grep -E '^[0-9.]+$' \
+    | awk '!seen[$0]++'
+}
+
+
+# Save the current DNS mode for a network service so it can be restored later.
+savednsstate() {
+  local service="$1"
+  local file
+  local dns
+
+  file=$(svcfile "$service")
+
+  if [[ -f "$file" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$STATEDIR"
+
+  if dns=$(manualdns "$service"); then
+    {
+      printf 'SERVICE=%s\n' "$service"
+      printf 'MODE=MANUAL\n'
+      printf '%s\n' "$dns"
+    } >"$file"
+    log "saved manual DNS state for $service"
+  else
+    {
+      printf 'SERVICE=%s\n' "$service"
+      printf 'MODE=AUTO\n'
+    } >"$file"
+    log "saved automatic DNS state for $service"
+  fi
+}
+
+
+# Move the office DNS server to the front of a service's resolver order.
+ensuredns() {
+  local service="$1"
+  local base
+  local dns
+  local current
+
+  savednsstate "$service"
+
+  if base=$(manualdns "$service"); then
+    :
+  else
+    base=$(effectivedns || true)
+  fi
+
+  dns=$(printf '%s\n%s\n' "$DNSSERVER" "$base" | awk 'NF && !seen[$0]++')
+  current=$(printf '%s\n' "$base" | awk 'NF')
+
+  if [[ "$current" == "$dns" ]]; then
+    log "DNS order already correct on $service: $(printf '%s' "$dns" | tr '\n' ' ')"
+    return 0
+  fi
+
+  if [[ -n "$dns" ]]; then
+    # DNS entries are plain IPs, so splitting into arguments is intentional.
+    # shellcheck disable=SC2086
+    set -- $dns
+    log "setting DNS on $service: $*"
+    sudo networksetup -setdnsservers "$service" "$@" >>"$LOG_OUT" 2>>"$LOG_ERR"
+  else
+    log "setting DNS on $service: $DNSSERVER"
+    sudo networksetup -setdnsservers "$service" "$DNSSERVER" >>"$LOG_OUT" 2>>"$LOG_ERR"
+  fi
+}
+
+
+# Restore the original DNS mode for a network service.
+restoredns() {
+  local service="$1"
+  local file
+  local mode
+  local dns
+
+  file=$(svcfile "$service")
+
+  if [[ -f "$file" ]]; then
+
+    # Read the saved DNS mode for this network service.
+    mode=$(awk -F= '/^MODE=/{print $2; exit}' "$file")
+
+    case "$mode" in
+      AUTO)
+        log "restoring automatic DNS on $service"
+        sudo networksetup -setdnsservers "$service" empty >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+        ;;
+      MANUAL)
+
+        # Read the saved manual DNS server list from the state file.
+        dns=$(awk '
+          /^MODE=MANUAL$/ { p=1; next }
+          p && NF { print }
+        ' "$file")
+
+        if [[ -n "$dns" ]]; then
+          # shellcheck disable=SC2086
+          set -- $dns
+          log "restoring manual DNS on $service: $*"
+          sudo networksetup -setdnsservers "$service" "$@" >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+        else
+          log "restoring empty manual DNS on $service"
+          sudo networksetup -setdnsservers "$service" empty >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+        fi
+        ;;
+    esac
+
+    rm -f "$file"
+    return 0
+  fi
+
+  if dns=$(manualdns "$service"); then
+    dns=$(printf '%s\n' "$dns" | awk -v d="$DNSSERVER" 'NF && $0 != d')
+
+    if [[ -n "$dns" ]]; then
+      # shellcheck disable=SC2086
+      set -- $dns
+      log "removing $DNSSERVER from $service, keeping: $*"
+      sudo networksetup -setdnsservers "$service" "$@" >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+    else
+      log "removing $DNSSERVER from $service and restoring automatic DNS"
+      sudo networksetup -setdnsservers "$service" empty >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+    fi
+  fi
+}
+
+
+# Return active macOS network services that are on the configured office network.
+corpservices() {
+  local service
+  local device
+  local ip
+
+  # Extract service/device pairs from networksetup's service-order output.
+  networksetup -listnetworkserviceorder 2>/dev/null \
+    | awk '
+        /^\([0-9*]+\)/ {
+          svc=$0
+          sub(/^\([0-9*]+\)[[:space:]]*/, "", svc)
+          next
+        }
+        /Device: / {
+          dev=$0
+          sub(/^.*Device: /, "", dev)
+          sub(/\).*/, "", dev)
+          if (svc != "" && dev != "") {
+            print svc "|" dev
+          }
+          svc=""
+          dev=""
+        }
+      ' \
+    | while IFS='|' read -r service device; do
+        [[ -n "$service" ]] || continue
+        [[ -n "$device" ]] || continue
+
+        ip=$(ipconfig getifaddr "$device" 2>/dev/null || true)
+
+        case "$ip" in
+          "${OFFICE_IP_PREFIX}"*)
+            printf '%s|%s\n' "$service" "$device"
+            ;;
+        esac
+      done
+}
+
+
+# Report whether a local mountpoint is currently mounted.
+ismounted() {
+  local mp="$1"
+
+  mount | grep -q "on ${mp} "
+}
+
+
+# Check whether SSH is reachable on a host before attempting SSHFS.
+sshup() {
+  local host="$1"
+
+  nc -z -w 2 "$host" 22 >/dev/null 2>&1
+}
+
+
+# Mount a single host with SSHFS if it is not already mounted.
+mounthost() {
+  local host="$1"
+  local mp="${MOUNT_ROOT}/$(localname "$host")"
+  local remote_target
+
+  mkdir -p "$mp"
+
+  if ismounted "$mp"; then
+    return 0
+  fi
+
+  if [[ -n "$REMOTE_PATH" ]]; then
+    remote_target="${host}:${REMOTE_PATH}"
+  else
+    remote_target="${host}:"
+  fi
+
+  log "mounting $remote_target -> $mp"
+
+  if "$SSHFS_BIN" "$remote_target" "$mp" \
+      -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,volname="$(localname "$host")",auto_cache \
+      >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+    log "mounted $host"
+  else
+    log_error "FAILED to mount $host"
+    warning "failed to mount $host"
+  fi
+}
+
+
+# Unmount a single managed host mountpoint if it is mounted.
+unmounthost() {
+  local host="$1"
+  local mp="${MOUNT_ROOT}/$(localname "$host")"
+
+  if ismounted "$mp"; then
+    log "unmounting $host ($mp)"
+    diskutil unmount "$mp" >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+  fi
+}
+
+
+# Restore DNS state for every service that mountctl previously changed.
+restorestatedns() {
+  local file
+  local service
+
+  if [[ -d "$STATEDIR" ]]; then
+    for file in "$STATEDIR"/*.dns; do
+      [[ -e "$file" ]] || break
+      service=$(awk -F= '/^SERVICE=/{print $2; exit}' "$file")
+      [[ -n "$service" ]] || continue
+      restoredns "$service" || true
+    done
+
+    rmdir "$STATEDIR" 2>/dev/null || true
+  fi
+}
+
+
+# Apply the office DNS server to all active office network services.
+dnsupall() {
+  local services="$1"
+  local service
+  local device
+
+  if [[ -z "$services" ]]; then
+    log "no ${OFFICE_IP_PREFIX}* network services detected for DNS setup"
+    info "No ${OFFICE_IP_PREFIX}* network services detected for DNS setup."
+    return 0
+  fi
+
+  while IFS='|' read -r service device; do
+    [[ -n "$service" ]] || continue
+    ensuredns "$service" || true
+  done <<< "$services"
+}
+
+
+# Mount every reachable managed host and unmount any unreachable ones.
+mountavailable() {
+  local host
+
+  for host in "${HOSTS[@]}"; do
+    if sshup "$host"; then
+      mounthost "$host" || true
+    else
+      unmounthost "$host"
+    fi
+  done
+}
+
+
+# Unmount every managed host mountpoint.
+unmountall() {
+  local host
+
+  for host in "${HOSTS[@]}"; do
+    unmounthost "$host"
+  done
+}
+
+
+# Print the current DNS and managed mount state in a human-readable form.
+statusreport() {
+  local services
+  local service
+  local device
+  local dns
+  local server
+  local host
+  local mp
+
+  services=$(corpservices || true)
+
+  printf 'DNS\n'
+
+  if [[ -n "$services" ]]; then
+    while IFS='|' read -r service device; do
+      [[ -n "$service" ]] || continue
+      printf '  %s (%s)\n' "$service" "$device"
+
+      if dns=$(manualdns "$service"); then
+        while IFS= read -r server; do
+          [[ -n "$server" ]] || continue
+          printf '    - %s\n' "$server"
+        done <<< "$dns"
+      else
+        printf '    - automatic\n'
+      fi
+    done <<< "$services"
+  else
+    printf '  no active %s* network services detected\n' "$OFFICE_IP_PREFIX"
+  fi
+
+  printf 'Mounts\n'
+
+  for host in "${HOSTS[@]}"; do
+    mp="${MOUNT_ROOT}/$(localname "$host")"
+
+    if ismounted "$mp"; then
+      printf '  %s mounted at %s\n' "$host" "$mp"
+    else
+      printf '  %s not mounted\n' "$host"
+    fi
+  done
+}
+
+
+# Execute the LaunchAgent mode: start in the office, stop elsewhere.
+autorun() {
+  local services
+
+  services=$(corpservices || true)
+
+  if [[ -n "$services" ]]; then
+    dnsupall "$services"
+    mountavailable
+  else
+    restorestatedns
+    unmountall
+  fi
+}
+
+
+# Dispatch a validated command to the appropriate action.
+runcommand() {
+  local command="$1"
+
+  case "$command" in
+    install|bootstrap)
+      ensurebootstrap
+      ;;
+    run|auto)
+      ensurebootstrap
+      autorun
+      ;;
+    start|up)
+      ensurebootstrap
+      dnsupall "$(corpservices || true)"
+      mountavailable
+      ;;
+    stop|down)
+      ensurebootstrap
+      restorestatedns
+      unmountall
+      ;;
+    dns-up)
+      ensurebootstrap
+      dnsupall "$(corpservices || true)"
+      ;;
+    dns-down)
+      ensurebootstrap
+      restorestatedns
+      ;;
+    mount)
+      ensurebootstrap
+      mountavailable
+      ;;
+    unmount)
+      ensurebootstrap
+      unmountall
+      ;;
+    status)
+      statusreport
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      error "unknown command: $command"
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+
+# Parse the CLI, check baseline dependencies, and execute the requested command.
+main() {
+  local command="${1:-run}"
+
+  need awk
+  need cksum
+  need date
+  need grep
+  need ipconfig
+  need launchctl
+  need mount
+  need nc
+  need networksetup
+  need pkgutil
+  need printf
+  need rmdir
+  need sudo
+
+  runcommand "$command"
+}
+
+main "$@"
