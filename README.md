@@ -1,6 +1,6 @@
-# macos-automounter
+# mountctl
 
-`macos-automounter` contains `mountctl`, a small macOS helper for:
+`mountctl` is a small macOS helper for:
 
 - forcing the London office DNS server to the front of the resolver list
 - mounting reachable London developer machines with SSHFS
@@ -72,7 +72,7 @@ That command:
 
 - installs the script to `/usr/local/bin/mountctl`
 - writes `~/Library/LaunchAgents/tools.xyzzy.mountctl.plist`
-- bootstraps the LaunchAgent into the current GUI session
+- reloads the LaunchAgent into the current GUI session
 - persists any install-time environment overrides into the LaunchAgent
 
 The LaunchAgent is configured with:

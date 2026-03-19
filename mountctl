@@ -55,6 +55,7 @@ set -euo pipefail
 readonly SELF_PATH="${BASH_SOURCE[0]:-$0}"
 readonly SCRIPT_NAME="$(basename "$SELF_PATH")"
 readonly HOSTS_ENV="${HOSTS:-}"
+readonly HOSTS_CSV_ENV="${HOSTS_CSV:-}"
 readonly DNSSERVER_ENV="${DNSSERVER:-}"
 readonly OFFICE_IP_PREFIX_ENV="${OFFICE_IP_PREFIX:-}"
 readonly REMOTE_PATH_ENV="${REMOTE_PATH:-}"
@@ -102,6 +103,11 @@ if [[ -n "$HOSTS_ENV" ]]; then
   # space-delimited host list like: HOSTS="dev07 dev08".
   # shellcheck disable=SC2206
   readonly HOSTS=(${HOSTS_ENV})
+elif [[ -n "$HOSTS_CSV_ENV" ]]; then
+  # LaunchAgents persist host overrides in a comma-safe form so multi-host
+  # values survive launchd environment handling.
+  IFS=',' read -r -a HOSTS_FROM_CSV <<< "$HOSTS_CSV_ENV"
+  readonly HOSTS=("${HOSTS_FROM_CSV[@]}")
 else
   readonly HOSTS=("${DEFAULT_HOSTS[@]}")
 fi
@@ -246,8 +252,9 @@ launchagentenvironmentxml() {
   local have_env=0
   local env_name
   local plist_key
+  local hosts_csv
 
-  if [[ -n "$HOSTS_ENV" ]]; then
+  if [[ -n "$HOSTS_ENV" || -n "$HOSTS_CSV_ENV" ]]; then
     have_env=1
   fi
 
@@ -265,9 +272,10 @@ launchagentenvironmentxml() {
   printf '    <key>EnvironmentVariables</key>\n'
   printf '    <dict>\n'
 
-  if [[ -n "$HOSTS_ENV" ]]; then
-    printf '      <key>HOSTS</key>\n'
-    printf '      <string>%s</string>\n' "$(xmlescape "$HOSTS_ENV")"
+  if [[ -n "$HOSTS_ENV" || -n "$HOSTS_CSV_ENV" ]]; then
+    hosts_csv=$(IFS=,; printf '%s' "${HOSTS[*]}")
+    printf '      <key>HOSTS_CSV</key>\n'
+    printf '      <string>%s</string>\n' "$(xmlescape "$hosts_csv")"
   fi
 
   for env_name in DNSSERVER_ENV OFFICE_IP_PREFIX_ENV REMOTE_PATH_ENV SSHFS_BIN_ENV SCRIPT_COLOUR_ENV; do
@@ -327,6 +335,14 @@ installlaunchagent() {
 }
 
 
+# Load or reload the LaunchAgent into the current GUI session.
+reloadlaunchagent() {
+  log "loading LaunchAgent ${LAUNCH_AGENT_LABEL}"
+  launchctl bootout "gui/$(id -u)" "$LAUNCH_AGENT_PLIST" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST" >>"$LOG_OUT" 2>>"$LOG_ERR"
+}
+
+
 # Validate external dependencies and print actionable setup guidance.
 checkdependencies() {
   local missing=()
@@ -370,13 +386,15 @@ checkdependencies() {
 
 # Install or refresh the script and its LaunchAgent before runtime actions.
 ensurebootstrap() {
+  local force_refresh="${1:-0}"
   local needs_install=0
+  local needs_reload=0
 
-  if [[ ! -x "$INSTALL_PATH" ]] || [[ "$SELF_PATH" != "$INSTALL_PATH" ]]; then
+  if (( force_refresh )) || [[ ! -x "$INSTALL_PATH" ]] || [[ "$SELF_PATH" != "$INSTALL_PATH" ]]; then
     needs_install=1
   fi
 
-  if [[ ! -f "$LAUNCH_AGENT_PLIST" ]]; then
+  if (( force_refresh )) || [[ ! -f "$LAUNCH_AGENT_PLIST" ]]; then
     needs_install=1
   fi
 
@@ -385,17 +403,16 @@ ensurebootstrap() {
     installself
     log "installing LaunchAgent at $LAUNCH_AGENT_PLIST"
     installlaunchagent
+    needs_reload=1
   fi
 
-  if ! launchagentloaded; then
-    ((needs_install += 1))
+  if (( force_refresh )) || ! launchagentloaded; then
     checkdependencies
-    log "loading LaunchAgent ${LAUNCH_AGENT_LABEL}"
-    launchctl bootout "gui/$(id -u)" "$LAUNCH_AGENT_PLIST" >/dev/null 2>&1 || true
-    launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST" >>"$LOG_OUT" 2>>"$LOG_ERR"
+    reloadlaunchagent
+    needs_reload=1
   fi
 
-  if (( needs_install > 0 )); then
+  if (( needs_install > 0 || needs_reload > 0 )); then
     log "bootstrap complete for ${LAUNCH_AGENT_LABEL}"
   fi
 }
@@ -807,7 +824,7 @@ runcommand() {
 
   case "$command" in
     install|bootstrap)
-      ensurebootstrap
+      ensurebootstrap 1
       ;;
     run|auto)
       ensurebootstrap
