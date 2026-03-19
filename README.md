@@ -13,9 +13,9 @@ The script is intended for a workstation that moves between office and non-offic
 `mountctl` manages two pieces of state:
 
 1. DNS
-   It detects active macOS network services on the configured office subnet prefix, defaulting to `172.16.*`, and moves `172.16.40.119` to the front of the DNS order so `*.office.edgewater.internal` resolves correctly.
+   It detects active macOS network services on the configured office subnet prefix, defaulting to `10.20.*`, and moves `10.20.40.200` to the front of the DNS order so `*.office.xyzzy.tools.internal` resolves correctly.
 2. SSHFS mounts
-   It probes the London developer machines and mounts the reachable ones under `~/mnt`.
+   It probes the London developer blades and mounts the reachable ones under `~/mnt`.
 
 When it changes DNS, it first stores the original resolver state in `/tmp/mountctl-dns`. That lets `stop` and `dns-down` restore the previous manual DNS list or automatic DHCP mode.
 
@@ -52,11 +52,13 @@ If `mountctl install` detects the deprecated Homebrew `sshfs` at `/opt/homebrew/
 
 Defaults:
 
-- `HOSTS="dev01 dev02 dev03 dev04 dev05 dev06 dev07 dev08 steve robin barry harry"`
-- `DNSSERVER=172.16.40.119`
-- `OFFICE_IP_PREFIX=172.16.`
+- `HOSTS="dev01 dev02 dev03 dev04 dev05 dev06 dev07 dev08"`
+- `DNSSERVER=10.20.40.200`
+- `OFFICE_IP_PREFIX=10.20.`
 - `REMOTE_PATH=""` which mounts the remote login user's home directory
-- `SSHFS_BIN=/usr/local/bin/sshfs`
+- `SSHFS_BIN=/usr/local/bin/sshfs` when the macFUSE SSHFS package is installed, otherwise `/opt/homebrew/bin/sshfs` if only the deprecated Homebrew SSHFS is present
+
+Install-time overrides are written into the generated LaunchAgent. If you want the background agent to keep using custom `HOSTS`, `DNSSERVER`, `OFFICE_IP_PREFIX`, `REMOTE_PATH`, `SSHFS_BIN`, or `SCRIPT_COLOUR` values, set them when you run `mountctl install`.
 
 ## Install
 
@@ -69,8 +71,9 @@ Clone the repo somewhere under your home directory, then run:
 That command:
 
 - installs the script to `/usr/local/bin/mountctl`
-- writes `~/Library/LaunchAgents/com.company.mountctl.plist`
+- writes `~/Library/LaunchAgents/tools.xyzzy.mountctl.plist`
 - bootstraps the LaunchAgent into the current GUI session
+- persists any install-time environment overrides into the LaunchAgent
 
 The LaunchAgent is configured with:
 
@@ -115,13 +118,13 @@ mountctl start
 Override the office DNS server IP:
 
 ```bash
-DNSSERVER=172.16.40.200 mountctl dns-up
+DNSSERVER=10.20.40.200 mountctl dns-up
 ```
 
 Override the managed host list:
 
 ```bash
-HOSTS="dev08 steve" mountctl mount
+HOSTS="dev07 dev08" mountctl mount
 ```
 
 Override the office network prefix match:
@@ -142,10 +145,16 @@ Override the SSHFS binary path:
 SSHFS_BIN=/custom/path/sshfs mountctl start
 ```
 
+Persist a custom host subset and DNS settings into the LaunchAgent:
+
+```bash
+HOSTS="dev07 dev08" DNSSERVER=10.20.40.200 OFFICE_IP_PREFIX=10.20. ./mountctl install
+```
+
 Combine multiple overrides:
 
 ```bash
-HOSTS="dev08 steve" OFFICE_IP_PREFIX=10.20. DNSSERVER=10.20.40.119 REMOTE_PATH=/srv/shared mountctl start
+HOSTS="dev07 dev08" OFFICE_IP_PREFIX=10.20. DNSSERVER=10.20.40.200 REMOTE_PATH=/srv/shared mountctl start
 ```
 
 ## Mount behavior
@@ -167,30 +176,30 @@ Mount points are created under:
 For example:
 
 ```text
+~/mnt/dev07
 ~/mnt/dev08
-~/mnt/steve
 ```
 
 ## DNS behavior
 
-On a London office network, `mountctl` rewrites the active network services whose IPs match `OFFICE_IP_PREFIX`, defaulting to `172.16.*`, so the DNS list begins with:
+On a London office network, `mountctl` rewrites the active network services whose IPs match `OFFICE_IP_PREFIX`, defaulting to `10.20.*`, so the DNS list begins with:
 
 ```text
-172.16.40.119
+10.20.40.200
 ```
 
-That is necessary because the corporate resolver can return `NXDOMAIN` for `office.edgewater.internal`, and macOS will not reliably fall through to the second DNS server after a negative response.
+That is necessary because the corporate resolver can return `NXDOMAIN` for `office.xyzzy.tools.internal`, and macOS will not reliably fall through to the second DNS server after a negative response.
 
 You can override the default office DNS server IP when needed:
 
 ```bash
-DNSSERVER=172.16.40.200 mountctl dns-up
+DNSSERVER=10.20.40.200 mountctl dns-up
 ```
 
 You can also override the office-network match prefix:
 
 ```bash
-OFFICE_IP_PREFIX=10.20. DNSSERVER=10.20.40.119 mountctl start
+OFFICE_IP_PREFIX=10.20. DNSSERVER=10.20.40.200 mountctl start
 ```
 
 When you run `stop`, `dns-down`, or when the LaunchAgent notices the machine is no longer on the office network, `mountctl` restores the previous DNS state from its saved state files.

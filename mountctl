@@ -45,15 +45,21 @@
 #   ./__SCRIPT_NAME__ install
 #   ./__SCRIPT_NAME__ start
 #   REMOTE_PATH=/var/tmp ./__SCRIPT_NAME__ mount
-#   DNSSERVER=172.16.40.200 ./__SCRIPT_NAME__ dns-up
-#   OFFICE_IP_PREFIX=10.20. DNSSERVER=10.20.40.119 ./__SCRIPT_NAME__ start
-#   HOSTS="dev08 steve" ./__SCRIPT_NAME__ mount
+#   DNSSERVER=10.20.40.200 ./__SCRIPT_NAME__ dns-up
+#   OFFICE_IP_PREFIX=10.20. DNSSERVER=10.20.40.200 ./__SCRIPT_NAME__ start
+#   HOSTS="dev07 dev08" ./__SCRIPT_NAME__ mount
 #------------------------------------------------------------------------
 
 set -euo pipefail
 
 readonly SELF_PATH="${BASH_SOURCE[0]:-$0}"
 readonly SCRIPT_NAME="$(basename "$SELF_PATH")"
+readonly HOSTS_ENV="${HOSTS:-}"
+readonly DNSSERVER_ENV="${DNSSERVER:-}"
+readonly OFFICE_IP_PREFIX_ENV="${OFFICE_IP_PREFIX:-}"
+readonly REMOTE_PATH_ENV="${REMOTE_PATH:-}"
+readonly SSHFS_BIN_ENV="${SSHFS_BIN:-}"
+readonly SCRIPT_COLOUR_ENV="${SCRIPT_COLOUR:-}"
 
 if [[ -n "${BASH_VERSINFO:-}" ]] && (( BASH_VERSINFO[0] < 4 )); then
   printf 'ERROR: this script requires bash 4+ (detected: %s).\n' \
@@ -61,7 +67,7 @@ if [[ -n "${BASH_VERSINFO:-}" ]] && (( BASH_VERSINFO[0] < 4 )); then
   exit 1
 fi
 
-readonly SCRIPT_COLOUR_MODE="${SCRIPT_COLOUR:-}"
+readonly SCRIPT_COLOUR_MODE="${SCRIPT_COLOUR_ENV}"
 
 if [[ -t 2 && ! "${SCRIPT_COLOUR_MODE,,}" =~ ^(off|false|0)$ ]]; then
   readonly COLOUR_ERROR=$'\033[31m'
@@ -90,28 +96,33 @@ readonly DEFAULT_HOSTS=(
   dev06
   dev07
   dev08
-  steve
-  robin
-  barry
-  harry
 )
-if [[ -n "${HOSTS:-}" ]]; then
+if [[ -n "$HOSTS_ENV" ]]; then
   # HOSTS is intentionally split on shell words so callers can pass a simple
-  # space-delimited host list like: HOSTS="dev08 steve".
+  # space-delimited host list like: HOSTS="dev07 dev08".
   # shellcheck disable=SC2206
-  readonly HOSTS=(${HOSTS})
+  readonly HOSTS=(${HOSTS_ENV})
 else
   readonly HOSTS=("${DEFAULT_HOSTS[@]}")
 fi
-readonly REMOTE_PATH="${REMOTE_PATH:-}"
+readonly REMOTE_PATH="${REMOTE_PATH_ENV}"
 readonly MOUNT_ROOT="${HOME}/mnt"
-readonly SSHFS_BIN="${SSHFS_BIN:-/usr/local/bin/sshfs}"
+readonly DEFAULT_VENDOR_SSHFS_BIN="/usr/local/bin/sshfs"
 readonly HOMEBREW_SSHFS_BIN="/opt/homebrew/bin/sshfs"
-readonly DNSSERVER="${DNSSERVER:-172.16.40.119}"
-readonly OFFICE_IP_PREFIX="${OFFICE_IP_PREFIX:-172.16.}"
+if [[ -n "$SSHFS_BIN_ENV" ]]; then
+  readonly SSHFS_BIN="${SSHFS_BIN_ENV}"
+elif [[ -x "$DEFAULT_VENDOR_SSHFS_BIN" ]]; then
+  readonly SSHFS_BIN="$DEFAULT_VENDOR_SSHFS_BIN"
+elif [[ -x "$HOMEBREW_SSHFS_BIN" ]]; then
+  readonly SSHFS_BIN="$HOMEBREW_SSHFS_BIN"
+else
+  readonly SSHFS_BIN="$DEFAULT_VENDOR_SSHFS_BIN"
+fi
+readonly DNSSERVER="${DNSSERVER_ENV:-10.20.40.200}"
+readonly OFFICE_IP_PREFIX="${OFFICE_IP_PREFIX_ENV:-10.20.}"
 readonly STATEDIR="${TMPDIR:-/tmp}/mountctl-dns"
 readonly INSTALL_PATH="/usr/local/bin/mountctl"
-readonly LAUNCH_AGENT_LABEL="com.company.mountctl"
+readonly LAUNCH_AGENT_LABEL="tools.xyzzy.mountctl"
 readonly LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist"
 readonly BREW_BIN="/opt/homebrew/bin/brew"
 readonly LOG_OUT="/tmp/mountctl.out"
@@ -216,43 +227,103 @@ installself() {
 }
 
 
+# Escape XML special characters for LaunchAgent environment values.
+xmlescape() {
+  local value="$1"
+
+  value=${value//&/&amp;}
+  value=${value//</&lt;}
+  value=${value//>/&gt;}
+  value=${value//\"/&quot;}
+  value=${value//\'/&apos;}
+
+  printf '%s' "$value"
+}
+
+
+# Emit LaunchAgent EnvironmentVariables entries for install-time overrides.
+launchagentenvironmentxml() {
+  local have_env=0
+  local env_name
+  local plist_key
+
+  if [[ -n "$HOSTS_ENV" ]]; then
+    have_env=1
+  fi
+
+  for env_name in DNSSERVER_ENV OFFICE_IP_PREFIX_ENV REMOTE_PATH_ENV SSHFS_BIN_ENV SCRIPT_COLOUR_ENV; do
+    if [[ -n "${!env_name:-}" ]]; then
+      have_env=1
+      break
+    fi
+  done
+
+  if (( ! have_env )); then
+    return 0
+  fi
+
+  printf '    <key>EnvironmentVariables</key>\n'
+  printf '    <dict>\n'
+
+  if [[ -n "$HOSTS_ENV" ]]; then
+    printf '      <key>HOSTS</key>\n'
+    printf '      <string>%s</string>\n' "$(xmlescape "$HOSTS_ENV")"
+  fi
+
+  for env_name in DNSSERVER_ENV OFFICE_IP_PREFIX_ENV REMOTE_PATH_ENV SSHFS_BIN_ENV SCRIPT_COLOUR_ENV; do
+    if [[ -n "${!env_name:-}" ]]; then
+      plist_key="${env_name%_ENV}"
+      printf '      <key>%s</key>\n' "$plist_key"
+      printf '      <string>%s</string>\n' "$(xmlescape "${!env_name}")"
+    fi
+  done
+
+  printf '    </dict>\n'
+}
+
+
 # Write the LaunchAgent plist that keeps mountctl running automatically.
 installlaunchagent() {
+  local env_xml=""
 
   mkdir -p "$(dirname "$LAUNCH_AGENT_PLIST")"
+  env_xml="$(launchagentenvironmentxml)"
 
-  cat >"$LAUNCH_AGENT_PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-  <dict>
-    <key>Label</key>
-    <string>${LAUNCH_AGENT_LABEL}</string>
-
-    <key>ProgramArguments</key>
-    <array>
-      <string>${INSTALL_PATH}</string>
-    </array>
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>StartInterval</key>
-    <integer>120</integer>
-
-    <key>KeepAlive</key>
-    <dict>
-      <key>NetworkState</key>
-      <true/>
-    </dict>
-
-    <key>StandardOutPath</key>
-    <string>${LOG_OUT}</string>
-    <key>StandardErrorPath</key>
-    <string>${LOG_ERR}</string>
-  </dict>
-</plist>
-EOF
+  {
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    printf '%s\n' '<plist version="1.0">'
+    printf '%s\n' '  <dict>'
+    printf '%s\n' '    <key>Label</key>'
+    printf '    <string>%s</string>\n' "$LAUNCH_AGENT_LABEL"
+    printf '\n'
+    printf '%s\n' '    <key>ProgramArguments</key>'
+    printf '%s\n' '    <array>'
+    printf '      <string>%s</string>\n' "$INSTALL_PATH"
+    printf '%s\n' '    </array>'
+    printf '\n'
+    if [[ -n "$env_xml" ]]; then
+      printf '%s\n' "$env_xml"
+    fi
+    printf '%s\n' '    <key>RunAtLoad</key>'
+    printf '%s\n' '    <true/>'
+    printf '\n'
+    printf '%s\n' '    <key>StartInterval</key>'
+    printf '%s\n' '    <integer>120</integer>'
+    printf '\n'
+    printf '%s\n' '    <key>KeepAlive</key>'
+    printf '%s\n' '    <dict>'
+    printf '%s\n' '      <key>NetworkState</key>'
+    printf '%s\n' '      <true/>'
+    printf '%s\n' '    </dict>'
+    printf '\n'
+    printf '%s\n' '    <key>StandardOutPath</key>'
+    printf '    <string>%s</string>\n' "$LOG_OUT"
+    printf '%s\n' '    <key>StandardErrorPath</key>'
+    printf '    <string>%s</string>\n' "$LOG_ERR"
+    printf '%s\n' '  </dict>'
+    printf '%s\n' '</plist>'
+  } >"$LAUNCH_AGENT_PLIST"
 }
 
 
@@ -265,12 +336,7 @@ checkdependencies() {
   fi
 
   if [[ ! -x "$SSHFS_BIN" ]]; then
-    if [[ -x "$HOMEBREW_SSHFS_BIN" ]]; then
-      warning "detected deprecated Homebrew sshfs at $HOMEBREW_SSHFS_BIN; continuing install. Prefer the macFUSE SSHFS package at /usr/local/bin/sshfs, or run with SSHFS_BIN=$HOMEBREW_SSHFS_BIN."
-      log "detected deprecated Homebrew sshfs at $HOMEBREW_SSHFS_BIN during install checks"
-    else
-      missing+=("Missing sshfs at $SSHFS_BIN. Install the current SSHFS package from macFUSE: https://macfuse.github.io/2025/11/11/SSHFS-3.7.5.html")
-    fi
+    missing+=("Missing sshfs at $SSHFS_BIN. Install the current SSHFS package from macFUSE: https://macfuse.github.io/2025/11/11/SSHFS-3.7.5.html")
   elif [[ "$SSHFS_BIN" == "$HOMEBREW_SSHFS_BIN" ]]; then
     warning "using deprecated Homebrew sshfs at $HOMEBREW_SSHFS_BIN; install will continue, but the preferred replacement is the macFUSE SSHFS package at /usr/local/bin/sshfs."
     log "using deprecated Homebrew sshfs at $HOMEBREW_SSHFS_BIN during install checks"
@@ -791,6 +857,13 @@ runcommand() {
 # Parse the CLI, check baseline dependencies, and execute the requested command.
 main() {
   local command="${1:-run}"
+
+  case "$command" in
+    help|-h|--help)
+      usage
+      return 0
+      ;;
+  esac
 
   need awk
   need cksum
